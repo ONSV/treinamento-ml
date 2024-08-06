@@ -1,0 +1,238 @@
+---
+title: "Treinamento ML"
+format: html
+date: today
+author: Pedro Augusto Borges
+toc: true
+cache: true
+
+---
+
+## Introdução
+
+O objetivo desse exemplo é aplicar um modelo de regressão logística binária, buscando prever em cada declaração de óbito se a vítima é um ocupante de motocicleta ou não. A modelagem é aplicada com a utilização do framework `{tidymodels}`, que reúne vários pacotes que auxiliam na criação de um modelo de machine learning.
+
+O foco desse documento não é explicar a parte conceitual e teórica de modelos de regressão logística e modelos de machine learning. Aqui vai ser descrito o passo a passo da aplicação de um modelo, com uso das funções do `{tidymodels}`. 
+
+Os dados utilizados nesse exemplo são as declarações de óbitos entre 1996 e 2022 do Sistema de Informação de Mortalidade, disponibilizados pelo DATASUS. O pacote `{roadtrafficdeaths}` contém o dataset dessa fonte, considerando apenas os óbitos ocorridos em sinistros de trânsito.
+
+```{r}
+#| label: setup
+#| message: false
+
+library(tidymodels)
+# remotes::install_github("pabsantos/roadtrafficdeaths")
+library(roadtrafficdeaths)
+```
+
+## Dados
+
+Ao carregar o pacote `{roadtrafficdeaths}` o dataset `rtdeaths` é automaticamente inserido no escopo global do projeto. Com a função `str()` é possível observar a estrutura da tabela, com as suas variáveis. Para entender melhor cada variável do dataset, é possível inserir o comando `?rtdeaths` no console, retornando uma documentação do pacote `{roadtrafficdeaths}`
+
+```{r}
+#| label: data_str
+
+str(rtdeaths)
+```
+
+### Criação da variável dependente
+
+A variável dependente (ou resposta) do modelo é saber se a vítima era ocupante do motocicleta ou não. Para isso, é necessário criar uma variável binária (dois resultados: motociclista ou não-motociclista) com base na variável existente `modal_vitima`. Primeiro, observa-se os valores únicos de `modal_vitima`
+
+```{r}
+unique(rtdeaths$modal_vitima)
+```
+
+A variável resposta vai considerar apenas a classe "Motociclista". Com auxílio do `ifelse()` foi possível criar essa nova variável. O `table()` retorna a quantidade de respostas em cada nível.
+
+Outro passo importante é transformar a variável em um `factor`, utilizando a função `as.factor`. Isso faz com que a variável que já está em texto seja identificada como classes na hora de aplicar o modelo.
+
+::: {.callout-warning}
+Ao criar o `factor`, utilizou-se como nível de referência o não-ocupante de motocicleta (`ref = "nao_ocupante"`). Isso é importante pois o modelo que será utilizado posteriormente - o `glm` - mede a probabilidade de rejeitar a hipótese nula em prol da hipótese alternativa de que o evento ocorra. Assim, o modelo entende que a classe de referência é a "não-ocorrência", e a probabilidade que ele quer medir é a "ocorrência". 
+:::
+
+```{r}
+#| label: new_var
+
+rtdeaths$ocupante_motocicleta <- ifelse(
+  rtdeaths$modal_vitima == "Motocicleta",
+  "ocupante",
+  "nao_ocupante"
+)
+
+rtdeaths$ocupante_motocicleta <- 
+  relevel(as.factor(rtdeaths$ocupante_motocicleta), ref = "nao_ocupante")
+
+table(rtdeaths$ocupante_motocicleta)
+```
+
+### Seleção de variáveis
+
+Com a variável dependente criada, o próximo passo é selecionar apenas as variáveis que serão utilizadas no modelo. Nesse exemplo as variáveis preditoras serão a idade da vítima, o sexo e a raça. Com a função `subset()` é possível selecionar as colunas necessárias.
+
+```{r}
+#| label: select_var
+
+vars <- c("ocupante_motocicleta", "idade_vitima", "sexo_vitima", "raca_vitima")
+
+model_data <- subset(rtdeaths, select = vars)
+
+str(model_data)
+```
+
+### Valores inválidos / vazios
+
+Por fim, é uma boa prática observar a quantidade de valores vazios (`NA`) na tabela de dados, e removê-los caso necessário. Valores `NA` na entrada do modelo podem prejudicar a sua qualidade. Também existe a possibilidade de inputar novos valores com técnicas de amostragem sintética, como o _bootstraping_. 
+
+A função `is.na()` filtra os valores que são vazios, retornando `TRUE` caso sejam. Com o `sum()` é possível essa quantidade de `TRUE`, assim contabilizando a quantidade de linhas com a presença de algum dado `NA`.
+
+```{r}
+is.na(model_data) |> sum()
+```
+
+A quantidade de linhas vazias retornou `r is.na(model_data) |> sum()`. É uma quantidade grande, mas como a amostra restante também é grande, optou-se por remover essas linhas, com o uso da função `na.omit()`. Alguns consideram essa remoção como uma prática não recomendada, pois pode se estar perdendo informação valiosa da amostra.
+
+```{r}
+model_data_valido <- na.omit(model_data)
+
+str(model_data_valido)
+```
+
+## Modelagem
+
+Com os dados de entrada prontos, inicia-se o processo de modelagem com auxílio do meta-pacote `{tidymodels}`. 
+
+### Divisão dos dados
+
+O próximo passo para iniciar a modelagem é dividir os dados em um conjunto de treino e outro de teste. O conjunto treino é utilizado para desenvolver e otimizar o modelo e em geral é o conjunto com a maior quantidade de dados. O conjunto teste serve para validar o modelo criado, possibilitando extrair parâmetros de desempenho ao comparar as respostas "reais" e as respostas previstas.
+
+A função `initial_split()` faz essa repartição de forma automática. Aqui, selecionou-se uma repartição de 80% do volume de dados para o treino (`prop = 0.80`) e decidiu-se utilizar a repartição estratificada, com base nas classes da variável resposta (`strata = ocupante_motocicleta`). Isso é importante pois esse parâmetro tenta balancear as duas classes resposta no mesmo dataset (treino ou teste).
+
+```{r}
+set.seed(1234)
+
+data_split <- 
+  initial_split(
+    model_data_valido,
+    prop = 0.80,
+    strata = ocupante_motocicleta
+  )
+data_split
+```
+
+Com o objeto `data_split` realizado, cria-se os datasets com `training()` e `testing()`.
+
+```{r}
+data_train <- training(data_split)
+data_test <- testing(data_split)
+```
+
+### _Recipe_
+
+Com os dados devidamente repartidos, o próximo passo é criar a **receita** do modelo, com a função `recipe()`. Aqui se escolhe a equação da regressão, os dados de entrada, e quais tratamentos são necessários aplicar nas variáveis, com o uso das funções `step_...()`.
+
+Como equação se tem `ocupante_motocicleta ~ idade_vitima + sexo_vitima + raca_vitima` e os dados de entrada são os dados de treino (`data_train`). `step_relevel()` é utilizado para selecionar qual o valor de referência nas variáveis independentes e `step_dummy()` é utilizado para transformar as variáveis categóricas em variáveis numéricas binárias (1 ou 0).
+
+```{r}
+model_recipe <- 
+  recipe(
+    ocupante_motocicleta ~ idade_vitima + sexo_vitima + raca_vitima,
+    data = data_train
+  ) |>
+  step_relevel(sexo_vitima, ref_level = "Masculino") |>
+  step_relevel(raca_vitima, ref_level = "Preta") |>
+  step_dummy(all_nominal_predictors())
+
+model_recipe
+```
+
+Com o uso do `prep()` e `bake()` é possível pre-processar esses passos a fim de observar como que ficam essas variáveis transformadas. 
+
+```{r}
+model_recipe |> prep() |> bake(new_data = NULL)
+```
+
+### _Model workflow_
+
+Com a receita do modelo pronta, o próximo passo é criar o objeto que controla o modelo em si. Como vai ser utilizada a regressão logística, o modelo inicia com essa definição: `logistic_reg()`. Em seguida, escolhe-se o motor do modelo com `set_engine()`. Aqui foi escolhido o `glm`, que é o modelo utilizado pelo próprio R base para criar regressões logísticas. Por fim, uma regressão logística pode ser utilizada para analisar valores numéricos ou categóricos. Neste caso, procura-se fazer o segundo. Assim, com o `set_mode()` é definido um modelo de classificação.
+
+```{r}
+rl_model <- logistic_reg() |>
+  set_engine("glm") |>
+  set_mode("classification")
+
+rl_model
+```
+
+O último passo antes de rodar o modelo é criar o objeto de `workflow`, que controla o fluxo de trabalho do modelo. Com `workflow()` é possível unir o objeto que controla a receita (`model_recipe`) e o objeto que controla o modelo (`rl_model`).
+
+```{r}
+model_wf <- workflow() |>
+  add_model(rl_model) |>
+  add_recipe(model_recipe)
+
+model_wf
+```
+
+### Regressões - Treinando o modelo
+
+Agora é possível treinar o modelo com uso da função `fit()`, tendo como input o workflow do modelo e os dados de treino. Aplicando `tidy()` com o parâmetro `exponentiate` é possível ver os resultados dos coeficientes do modelo, transformando os coeficientes estimados que vêm originalmente em log para escala decimal.
+
+```{r}
+lr_fit <- fit(model_wf, data_train)
+fit_results <- tidy(lr_fit, exponentiate = TRUE)
+fit_results
+```
+
+Com os resultados, observa-se que apenas `raca_vitima_Indígena` apresentou um p-valor acima de 0.05. Excluindo `raca_vitima_Parda`, todos os coeficientes apresentaram uma razão de chances abaixo de 1. 
+
+### Predições - Testando o modelo
+
+Com o modelo calculado, é possível fazer uma predição com os dados de teste. A função `augment()` faz isso, tendo como entrada o objeto do modelo calculado - `lr_fit` - e os dados de teste - `data_test`. Isso retorna um dataset com os resultados previstos pelo modelo (`.pred_class`) as probabilidades numéricas da ocorrência ou não-ocorrência (`.pred_ocupante` e `.pred_nao_ocupante`)
+
+```{r}
+predicted_values <- augment(lr_fit, data_test)
+
+predicted_values
+```
+
+### Medindo o desempenho de predição
+
+Existem inúmeros parâmetros e métodos para medir o desempenho de um modelo preditivo. Aqui serão realizadas a elaboração de uma matriz de confusão e a plotagem de uma curva ROC.
+
+Com base no dataset com as previsões e os resultados originais (`predicted_values`), é possível aplicar a função `conf_mat()`. A matriz resultante compara os valores previstos com os valores reais, contabilizados no dataset resultante do teste.
+
+```{r}
+conf_mat(predicted_values, truth = ocupante_motocicleta, estimate = .pred_class)
+```
+
+Outro parâmetro possível de calcular á a área de baixo da curva ROC, que pode variar de 0.5 a 1. Quanto mais próximo de 1, melhor a capacidade do modelo de realizar previsões.
+
+::: {.callout-warning}
+Existe um conflito entre o que o `glm` e o que o `tidymodels` define como valor de referência em uma regressão logística. Como explicado anteriormente, para medir a ocorrência de "ocupante" em `ocupante_motocicleta`, o nível de referência deve ser "nao_ocupante". Porém, a função `roc_auc()` sempre tenta medir o evento com base no primeiro nível que aparece, que nesse caso é "nao_ocupante". Para solucionar esse conflito, deve-se utilizar o parâmetro `event_level = "second"`.
+:::
+
+```{r}
+roc_auc(
+  data = predicted_values,
+  truth = ocupante_motocicleta,
+  .pred_ocupante,
+  event_level = "second"
+)
+```
+
+O resultado de 0.646 mostra que o desempenho em prever os ocupantes de motocicleta é relativamente baixo. Por fim, é possível plotar a curva ROC com auxílio das funções `roc_curve()` e `autoplot()`.
+
+```{r}
+roc_curve(
+  predicted_values,
+  ocupante_motocicleta,
+  .pred_ocupante,
+  event_level = "second"
+) |>
+  autoplot()
+```
+
+## Conclusão
+
+Neste documento foi possível apresentar um exemplo de aplicação do `{tidymodels}`, utilizando uma regressão logística para classificar as vítimas fatais de um sinistro como ocupante ou não-ocupante de motocicleta. O desempenho em prever os resultados não foi satisfatório, mas foi possível extrair coeficientes estimados que foram estatisticamente significativos. 
